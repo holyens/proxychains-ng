@@ -77,6 +77,7 @@ unsigned int remote_dns_subnet = 224;
 pthread_once_t init_once = PTHREAD_ONCE_INIT;
 
 static int init_l = 0;
+static int reading_config = 0;
 
 static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_type * ct);
 
@@ -126,14 +127,14 @@ static void do_init(void) {
 	srand(time(NULL));
 	core_initialize();
 	at_init();
-
+	setup_hooks();
 	/* read the config file */
 	get_chain_data(proxychains_pd, &proxychains_proxy_count, &proxychains_ct);
 	DUMP_PROXY_CHAIN(proxychains_pd, proxychains_proxy_count);
 
 	proxychains_write_log(LOG_PREFIX "DLL init: proxychains-ng %s\n", proxychains_get_version());
 
-	setup_hooks();
+	putenv("PROXYCHAINS_INITED=1");
 
 	while(close_fds_cnt) true_close(close_fds[--close_fds_cnt]);
 
@@ -185,7 +186,7 @@ typedef enum {
 static int proxy_from_string(const char *proxystring,
 	char *type_buf,
 	char* host_buf,
-	int *port_n,
+	char* port_buf,
 	char *user_buf,
 	char* pass_buf)
 {
@@ -237,7 +238,9 @@ static int proxy_from_string(const char *proxystring,
 		return 0;
 	memcpy(host_buf, h, hl);
 	host_buf[hl]=0;
-	*port_n = atoi(p+1);
+	pl = strcspn(p+1, "\n\r \t");
+	memcpy(port_buf, p+1, pl);
+	port_buf[pl]=0;
 	switch(proxytype) {
 		case RS_PT_SOCKS4:
 			strcpy(type_buf, "socks4");
@@ -263,12 +266,13 @@ static const char* bool_str(int bool_val) {
 
 /* get configuration from config file */
 static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_type * ct) {
-	int count = 0, port_n = 0, list = 0;
-	char buff[1024], type[1024], host[1024], user[1024];
+	int count = 0, list = 0, s;
+	char buff[1024], type[1024], host[1024], user[1024], port[16], ip[48];
 	char *env;
 	char local_in_addr_port[32];
 	char local_in_addr[32], local_in_port[32], local_netmask[32];
 	FILE *file = NULL;
+	struct addrinfo hints, *result;
 
 	if(proxychains_got_chain_data)
 		return;
@@ -299,37 +303,52 @@ static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_typ
 				memset(&pd[count], 0, sizeof(proxy_data));
 
 				pd[count].ps = PLAY_STATE;
-				port_n = 0;
 
-				int ret = sscanf(buff, "%s %s %d %s %s", type, host, &port_n, pd[count].user, pd[count].pass);
+				int ret = sscanf(buff, "%s %s %s %s %s", type, host, port, pd[count].user, pd[count].pass);
 				if(ret < 3 || ret == EOF) {
-					if(!proxy_from_string(buff, type, host, &port_n, pd[count].user, pd[count].pass)) {
+					if(!proxy_from_string(buff, type, host, port, pd[count].user, pd[count].pass)) {
 						inv:
 						fprintf(stderr, "error: invalid item in proxylist section: %s", buff);
 						exit(1);
 					}
 				}
+				/* Allow use both hostname and ip as host in proxylist now */
+				reading_config = 1;
+				memset(&hints, 0, sizeof(struct addrinfo));
+				hints.ai_flags = AI_NUMERICSERV;
+				s = getaddrinfo(host, port, &hints, &result);
+				if (0 != s || result == NULL) {
+					fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(s));
+					goto inv;
+				}
 
 				memset(&pd[count].ip, 0, sizeof(pd[count].ip));
-				pd[count].ip.is_v6 = !!strchr(host, ':');
-				pd[count].port = htons((unsigned short) port_n);
-				ip_type* host_ip = &pd[count].ip;
-				if(1 != inet_pton(host_ip->is_v6 ? AF_INET6 : AF_INET, host, host_ip->addr.v6)) {
-					if(*ct == STRICT_TYPE && proxychains_resolver && count > 0) {
-						/* we can allow dns hostnames for all but the first proxy in the list if chaintype is strict, as remote lookup can be done */
-						ip_type4 internal_ip = at_get_ip_for_host(host, strlen(host));
+				switch (result->ai_family) {
+					case AF_INET:
 						pd[count].ip.is_v6 = 0;
-						host_ip->addr.v4 = internal_ip;
-						if(internal_ip.as_int == ip_type_invalid.addr.v4.as_int)
-							goto inv_host;
-					} else {
-inv_host:
-						fprintf(stderr, "proxy %s has invalid value or is not numeric\n", host);
-						fprintf(stderr, "non-numeric ips are only allowed under the following circumstances:\n");
-						fprintf(stderr, "chaintype == strict (%s), proxy is not first in list (%s), proxy_dns active (%s)\n\n", bool_str(*ct == STRICT_TYPE), bool_str(count > 0), bool_str(proxychains_resolver));
-						exit(1);
-					}
+						memcpy(pd[count].ip.addr.v6, &(((struct sockaddr_in*)result->ai_addr)->sin_addr), (size_t)result->ai_addrlen);
+						pd[count].port = ((struct sockaddr_in*)result->ai_addr)->sin_port;
+						if(NULL== getenv("PROXYCHAINS_INITED"))
+							fprintf(stderr, LOG_PREFIX "proxy: %s://%s:%d (%s)\n", \
+								type, host, ntohs(pd[count].port), \
+								inet_ntop(AF_INET, pd[count].ip.addr.v6, ip, (socklen_t) 20));
+						break;
+					case AF_INET6:
+						pd[count].ip.is_v6 = 1;
+						memcpy(pd[count].ip.addr.v6, &(((struct sockaddr_in6*)result->ai_addr)->sin6_addr), (size_t)result->ai_addrlen);
+						pd[count].port = ((struct sockaddr_in6*)result->ai_addr)->sin6_port;
+						if(NULL== getenv("PROXYCHAINS_INITED"))
+							fprintf(stderr, LOG_PREFIX "proxy: %s://%s:%d (%s)\n", \
+								type, host, ntohs(pd[count].port), \
+								inet_ntop(AF_INET6, pd[count].ip.addr.v6, ip, (socklen_t) 48));
+						break;
+					default:
+						fprintf(stderr, "socktype == SOCK_STREAM %s", bool_str(result->ai_socktype==SOCK_STREAM));
+						goto inv;
 				}
+				freeaddrinfo(result);
+				reading_config = 0;				
+				/* End of hostname resolution */
 
 				if(!strcmp(type, "http")) {
 					pd[count].pt = HTTP_TYPE;
@@ -340,8 +359,9 @@ inv_host:
 				} else
 					goto inv;
 
-				if(port_n)
-					count++;
+				if(!pd[count].port)
+					goto inv;
+				count++;
 			} else {
 				if(strstr(buff, "[ProxyList]")) {
 					list = 1;
@@ -438,6 +458,8 @@ inv_host:
 /*******  HOOK FUNCTIONS  *******/
 
 int close(int fd) {
+	if(reading_config)
+		return true_close(fd);
 	if(!init_l) {
 		if(close_fds_cnt>=(sizeof close_fds/sizeof close_fds[0])) goto err;
 		close_fds[close_fds_cnt++] = fd;
@@ -457,6 +479,8 @@ static int is_v4inv6(const struct in6_addr *a) {
 	return !memcmp(a->s6_addr, "\0\0\0\0\0\0\0\0\0\0\xff\xff", 12);
 }
 int connect(int sock, const struct sockaddr *addr, unsigned int len) {
+	if(reading_config)
+		return true_connect(sock, addr, len);
 	INIT();
 	PFUNC();
 
@@ -536,6 +560,8 @@ int __xnet_connect(int sock, const struct sockaddr *addr, unsigned int len) {
 
 static struct gethostbyname_data ghbndata;
 struct hostent *gethostbyname(const char *name) {
+	if(reading_config)
+		return true_gethostbyname(name);
 	INIT();
 	PDEBUG("gethostbyname: %s\n", name);
 
@@ -548,6 +574,8 @@ struct hostent *gethostbyname(const char *name) {
 }
 
 int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
+	if(reading_config)
+		return true_getaddrinfo(node, service, hints, res);
 	INIT();
 	PDEBUG("getaddrinfo: %s %s\n", node ? node : "null", service ? service : "null");
 
@@ -558,6 +586,10 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
 }
 
 void freeaddrinfo(struct addrinfo *res) {
+	if(reading_config) {
+		true_freeaddrinfo(res);
+		return;
+	}
 	INIT();
 	PDEBUG("freeaddrinfo %p \n", (void *) res);
 
@@ -571,6 +603,8 @@ int pc_getnameinfo(const struct sockaddr *sa, socklen_t salen,
 	           char *host, socklen_t hostlen, char *serv,
 	           socklen_t servlen, int flags)
 {
+	if(reading_config)
+		return true_getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
 	INIT();
 	PFUNC();
 
@@ -612,6 +646,8 @@ int pc_getnameinfo(const struct sockaddr *sa, socklen_t salen,
 }
 
 struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type) {
+	if(reading_config)
+		return true_gethostbyaddr(addr, len, type);
 	INIT();
 	PDEBUG("TODO: proper gethostbyaddr hook\n");
 
@@ -649,6 +685,8 @@ struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type) {
 
 ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
 	       const struct sockaddr *dest_addr, socklen_t addrlen) {
+	if(reading_config)
+		return true_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
 	INIT();
 	PFUNC();
 	if (flags & MSG_FASTOPEN) {
